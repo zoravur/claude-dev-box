@@ -33,7 +33,7 @@
 #   terraform output -raw power_links   # bookmark the ?action=start one
 
 terraform {
-  required_version = ">= 1.5"
+  required_version = ">= 1.6" # import blocks with expressions
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -315,6 +315,8 @@ resource "aws_instance" "dev" {
         -v /srv/claude-home:/home/node \
         claude-dev
     fi
+    # Drop images left behind by earlier builds (unused ones only).
+    docker image prune -f
 
     # --- Convenience commands on the host (sudo: Session Manager logs in as
     # ssm-user, which is not in the docker group) ---
@@ -467,6 +469,18 @@ resource "aws_iam_role_policy" "power_ec2" {
       }
     ]
   })
+}
+
+# Lambda created this log group on first run; Terraform adopts it (import is
+# a no-op once it's in state) to set an expiry.
+import {
+  to = aws_cloudwatch_log_group.power
+  id = "/aws/lambda/${var.name}-power"
+}
+
+resource "aws_cloudwatch_log_group" "power" {
+  name              = "/aws/lambda/${var.name}-power"
+  retention_in_days = 90
 }
 
 resource "aws_lambda_function" "power" {
