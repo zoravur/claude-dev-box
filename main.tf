@@ -2,15 +2,21 @@
 #
 # Usage:
 #   terraform init
-#   terraform apply -var="allowed_ssh_cidr=$(curl -s ifconfig.me)/32"
+#   terraform apply
 #
 # Bootstrapping takes ~3-5 min after apply; check /var/log/cloud-init-output.log.
 #
-# One-time setup (Remote Control needs a claude.ai login, NOT an API key):
-#   ssh -t ubuntu@<public_ip> claude-dev     # run /login, pick claude.ai, then /exit
-#   ssh -t ubuntu@<public_ip> claude-attach  # answer "Enable Remote Control?" (y)
-#                                            # and "Trust /workspace?" (y),
-#                                            # then detach with Ctrl-b d
+# Shell access is via AWS Systems Manager Session Manager: no open ports, no
+# SSH keys, no IP allowlist. Open `terraform output -raw session_manager_url`
+# in any browser (works on a phone), signed in to the AWS console.
+# SSH is optional: pass -var="allowed_ssh_cidr=1.2.3.4/32" to enable it.
+#
+# One-time setup in a Session Manager shell (Remote Control needs a claude.ai
+# login, NOT an API key):
+#   claude-dev      # run /login, pick claude.ai, then /exit
+#   claude-attach   # answer "Enable Remote Control?" (y) and
+#                   # "Trust /workspace?" (y), then just close the tab;
+#                   # the tmux session keeps running
 #
 # After that, every time the instance boots, `claude remote-control` starts on
 # its own and the session appears in the Claude app's Code tab as "claude-dev".
@@ -61,7 +67,8 @@ variable "ssh_public_key_path" {
 
 variable "allowed_ssh_cidr" {
   type        = string
-  description = "CIDR allowed to SSH in, e.g. 203.0.113.4/32 (your IP)"
+  default     = null
+  description = "Optional: CIDR allowed to SSH in, e.g. 203.0.113.4/32. Leave null for Session Manager only."
 }
 
 variable "name" {
@@ -77,15 +84,18 @@ data "aws_vpc" "default" {
 
 resource "aws_security_group" "dev" {
   name        = "${var.name}-sg"
-  description = "SSH access to Claude Code dev box"
+  description = "Claude Code dev box (egress only unless SSH enabled)"
   vpc_id      = data.aws_vpc.default.id
 
-  ingress {
-    description = "SSH"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = [var.allowed_ssh_cidr]
+  dynamic "ingress" {
+    for_each = var.allowed_ssh_cidr == null ? [] : [var.allowed_ssh_cidr]
+    content {
+      description = "SSH"
+      from_port   = 22
+      to_port     = 22
+      protocol    = "tcp"
+      cidr_blocks = [ingress.value]
+    }
   }
 
   egress {
@@ -99,8 +109,33 @@ resource "aws_security_group" "dev" {
 }
 
 resource "aws_key_pair" "dev" {
+  count      = var.allowed_ssh_cidr == null ? 0 : 1
   key_name   = "${var.name}-key"
   public_key = file(pathexpand(var.ssh_public_key_path))
+}
+
+# ---------- Session Manager access ----------
+
+resource "aws_iam_role" "dev" {
+  name = "${var.name}-instance"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "dev_ssm" {
+  role       = aws_iam_role.dev.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "dev" {
+  name = "${var.name}-instance"
+  role = aws_iam_role.dev.name
 }
 
 # ---------- AMI ----------
@@ -120,8 +155,9 @@ data "aws_ami" "ubuntu" {
 resource "aws_instance" "dev" {
   ami                    = data.aws_ami.ubuntu.id
   instance_type          = var.instance_type
-  key_name               = aws_key_pair.dev.key_name
+  key_name               = one(aws_key_pair.dev[*].key_name)
   vpc_security_group_ids = [aws_security_group.dev.id]
+  iam_instance_profile   = aws_iam_instance_profile.dev.name
 
   root_block_device {
     volume_size = var.volume_size_gb
@@ -182,18 +218,19 @@ resource "aws_instance" "dev" {
       -v /srv/claude-home:/home/node \
       claude-dev
 
-    # --- Convenience commands on the host ---
+    # --- Convenience commands on the host (sudo: Session Manager logs in as
+    # ssm-user, which is not in the docker group) ---
     cat > /usr/local/bin/claude-dev <<'EOF'
     #!/bin/bash
-    exec docker exec -it -w /workspace claude-dev claude "$@"
+    exec sudo docker exec -it -w /workspace claude-dev claude "$@"
     EOF
     cat > /usr/local/bin/dev-shell <<'EOF'
     #!/bin/bash
-    exec docker exec -it -w /workspace claude-dev bash
+    exec sudo docker exec -it -w /workspace claude-dev bash
     EOF
     cat > /usr/local/bin/claude-attach <<'EOF'
     #!/bin/bash
-    exec docker exec -it claude-dev tmux attach -t claude
+    exec sudo docker exec -it claude-dev tmux attach -t claude
     EOF
     chmod +x /usr/local/bin/claude-dev /usr/local/bin/dev-shell /usr/local/bin/claude-attach
   EOT
@@ -361,12 +398,22 @@ output "public_ip" {
   value = aws_instance.dev.public_ip
 }
 
-output "connect_claude" {
-  value = "ssh -t ubuntu@${aws_instance.dev.public_ip} claude-dev"
+output "instance_id" {
+  value = aws_instance.dev.id
 }
 
-output "connect_shell" {
-  value = "ssh -t ubuntu@${aws_instance.dev.public_ip} dev-shell"
+# Browser shell (sign in to the AWS console first); works from a phone.
+output "session_manager_url" {
+  value = "https://${var.region}.console.aws.amazon.com/systems-manager/session-manager/${aws_instance.dev.id}?region=${var.region}"
+}
+
+# From a laptop with the AWS CLI + Session Manager plugin installed.
+output "connect_ssm" {
+  value = "aws ssm start-session --region ${var.region} --target ${aws_instance.dev.id}"
+}
+
+output "connect_ssh" {
+  value = var.allowed_ssh_cidr == null ? "SSH disabled (set allowed_ssh_cidr to enable)" : "ssh -t ubuntu@${aws_instance.dev.public_ip} claude-dev"
 }
 
 output "power_url" {

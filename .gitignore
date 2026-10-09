@@ -1,6 +1,9 @@
+# Repo lives in a home directory: track only the Terraform files.
+/*
+!/main.tf
+!/.gitignore
 .terraform/
 *.tfstate
 *.tfstate.*
 *.tfvars
 .build/
-crash.log
