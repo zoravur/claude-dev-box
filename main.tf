@@ -244,6 +244,10 @@ resource "aws_instance" "dev" {
     #!/bin/bash
     set -euxo pipefail
 
+    # cloud-init keeps scripts from earlier user_data versions here and runs
+    # them all on every boot; only this one should run from now on.
+    find /var/lib/cloud/instance/scripts -maxdepth 1 -type f ! -name provision.sh -delete
+
     if ! command -v docker >/dev/null; then
       apt-get update
       apt-get install -y docker.io git
@@ -394,6 +398,9 @@ data "archive_file" "power" {
 
 
       def handler(event, context):
+          # Browsers also fetch /favicon.ico; don't treat that as a call.
+          if event.get("rawPath", "/") != "/":
+              return reply(404, {"error": "not found"})
           headers = {k.lower(): v for k, v in (event.get("headers") or {}).items()}
           qs = event.get("queryStringParameters") or {}
           supplied = headers.get("x-token") or qs.get("token") or ""
