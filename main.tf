@@ -20,6 +20,10 @@
 #
 # After that, every time the instance boots, `claude remote-control` starts on
 # its own and the session appears in the Claude app's Code tab as "claude-dev".
+#
+# The instance stops itself after var.idle_stop_minutes of inactivity
+# (idle-stop.sh). Start it again from your phone with the power URL:
+#   terraform output -raw power_links   # bookmark the ?action=start one
 
 terraform {
   required_version = ">= 1.5"
@@ -74,6 +78,12 @@ variable "allowed_ssh_cidr" {
 variable "name" {
   type    = string
   default = "claude-dev"
+}
+
+variable "idle_stop_minutes" {
+  type        = number
+  default     = 30
+  description = "Stop the instance after this many minutes with no Claude activity, open shell or CPU load."
 }
 
 # ---------- Networking (default VPC) ----------
@@ -159,6 +169,9 @@ resource "aws_instance" "dev" {
   vpc_security_group_ids = [aws_security_group.dev.id]
   iam_instance_profile   = aws_iam_instance_profile.dev.name
 
+  # idle-stop runs `shutdown -h now`; make sure that stops (not terminates).
+  instance_initiated_shutdown_behavior = "stop"
+
   root_block_device {
     volume_size = var.volume_size_gb
     volume_type = "gp3"
@@ -233,6 +246,11 @@ resource "aws_instance" "dev" {
     exec sudo docker exec -it claude-dev tmux attach -t claude
     EOF
     chmod +x /usr/local/bin/claude-dev /usr/local/bin/dev-shell /usr/local/bin/claude-attach
+
+    # --- Auto-stop when idle (see idle-stop.sh) ---
+    echo '${base64encode(file("${path.module}/idle-stop.sh"))}' | base64 -d > /usr/local/bin/idle-stop
+    chmod +x /usr/local/bin/idle-stop
+    echo '*/5 * * * * root IDLE_MINUTES=${var.idle_stop_minutes} /usr/local/bin/idle-stop' > /etc/cron.d/idle-stop
   EOT
 
   tags = { Name = var.name }

@@ -1,6 +1,7 @@
 # Repo lives in a home directory: track only the Terraform files.
 /*
 !/main.tf
+!/idle-stop.sh
 !/.gitignore
 .terraform/
 *.tfstate
