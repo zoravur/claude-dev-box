@@ -93,6 +93,12 @@ variable "idle_stop_minutes" {
   description = "Stop the instance after this many minutes with no Claude activity, open shell or CPU load."
 }
 
+variable "swap_size_gb" {
+  type        = number
+  default     = 4
+  description = "Swap file size; running out of RAM slows things down instead of killing a session."
+}
+
 variable "sandbox_cidr" {
   type    = string
   default = "10.42.0.0/16"
@@ -254,6 +260,17 @@ resource "aws_instance" "dev" {
     fi
     systemctl enable --now docker
     usermod -aG docker ubuntu
+
+    # --- Swap (recreated if swap_size_gb changes) ---
+    if [ "$(stat -c %s /swapfile 2>/dev/null)" != "$((${var.swap_size_gb} * 1024 * 1024 * 1024))" ]; then
+      swapoff /swapfile 2>/dev/null || true
+      rm -f /swapfile
+      fallocate -l ${var.swap_size_gb}G /swapfile
+      chmod 600 /swapfile
+      mkswap /swapfile
+    fi
+    swapon --show=NAME --noheadings | grep -qx /swapfile || swapon /swapfile
+    sysctl -w vm.swappiness=10 # use RAM first; swap is the safety net
 
     # --- Dev container image ---
     mkdir -p /opt/claude-dev
