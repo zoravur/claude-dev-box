@@ -115,6 +115,17 @@ variable "sandbox_max_volume_gb" {
   default = 50
 }
 
+variable "sandbox_account_email" {
+  type        = string
+  description = "Root email for the sandbox AWS account; must be unique across AWS (a Gmail +suffix works). Set it in terraform.tfvars, which is gitignored."
+}
+
+variable "sandbox_monthly_budget_usd" {
+  type        = number
+  default     = 25
+  description = "Monthly spend cap for the sandbox account. At 100% of actual spend, a policy blocking new resources is attached automatically."
+}
+
 # ---------- Networking (default VPC) ----------
 
 data "aws_vpc" "default" {
@@ -542,8 +553,9 @@ resource "aws_lambda_permission" "power_invoke" {
 # Lets Claude, from inside the container, run shell commands on this host as
 # root (SSM Run Command) and read the power switch's logs. Anything running in
 # the container gets the same access. Intended blast radius: this instance,
-# plus read-only on its power logs. Changes to anything else in AWS go through
-# `terraform apply` by a human (the role has no EC2/IAM/Lambda write access).
+# plus read-only on its power logs, plus the sandbox VPC and sandbox account
+# below. Changes to anything else in AWS go through `terraform apply` by a
+# human (the role has no EC2/IAM/Lambda write access in this account).
 #   aws ssm send-command --instance-ids <id> --document-name AWS-RunShellScript \
 #     --parameters 'commands=["uptime"]'
 #   aws logs filter-log-events --log-group-name /aws/lambda/claude-dev-power
@@ -872,6 +884,268 @@ resource "aws_iam_role_policy" "dev_sandbox_admin" {
   })
 }
 
+# ---------- Sandbox account ----------
+# A separate AWS account that Claude fully administers: any service, any
+# resource, its own IAM. The account boundary is the isolation, so nothing
+# Claude does there can reach this account (the dev box, its role, the power
+# Lambda or this Terraform). Claude gets in by assuming the account's
+# OrganizationAccountAccessRole (AdministratorAccess), which Organizations
+# creates and which trusts this account.
+#
+# Guardrails, as SCPs attached to the account (they bind every principal in
+# it, including that admin role):
+#   - always: can't leave the org, can't use regions other than var.region,
+#     can't modify the admin role, can't buy reservations, savings plans,
+#     domains or Marketplace subscriptions;
+#   - at var.sandbox_monthly_budget_usd of actual spend, a budget action
+#     attaches a policy that blocks everything except reading, stopping and
+#     deleting. Running resources keep billing until they're stopped, and
+#     billing data lags by hours, so this is a near-cap, not a hard one.
+#
+# This account becomes the organization's management account. If it already
+# is one, import it first:
+#   terraform import aws_organizations_organization.this <o-xxxxxxxxxx>
+#
+# On the dev box:  aws --profile sandbox sts get-caller-identity
+# (the profile lives in ~/.aws/config; see the sandbox_cli_profile output)
+
+resource "aws_organizations_organization" "this" {
+  feature_set          = "ALL"
+  enabled_policy_types = ["SERVICE_CONTROL_POLICY"]
+}
+
+resource "aws_organizations_account" "sandbox" {
+  name              = "${var.name}-sandbox"
+  email             = var.sandbox_account_email
+  close_on_deletion = true # removing it from Terraform closes the account
+  depends_on        = [aws_organizations_organization.this]
+
+  lifecycle {
+    prevent_destroy = true
+    ignore_changes  = [role_name, iam_user_access_to_billing]
+  }
+}
+
+locals {
+  sandbox_account_id = aws_organizations_account.sandbox.id
+  sandbox_admin_role = "arn:aws:iam::${local.sandbox_account_id}:role/OrganizationAccountAccessRole"
+  # Not regional, so the region lock must not apply to them.
+  global_services = [
+    "iam:*", "sts:*", "organizations:*", "account:*", "route53:*", "route53domains:*",
+    "cloudfront:*", "waf:*", "globalaccelerator:*", "budgets:*", "ce:*", "cur:*",
+    "health:*", "support:*", "trustedadvisor:*", "pricing:*", "s3:GetBucketLocation",
+    "s3:ListAllMyBuckets", "acm:*", "kms:*", "shield:*", "networkmanager:*",
+  ]
+}
+
+resource "aws_organizations_policy" "sandbox_guardrails" {
+  name        = "${var.name}-sandbox-guardrails"
+  description = "Always on: stay in the org, stay in ${var.region}, leave the admin role alone"
+  type        = "SERVICE_CONTROL_POLICY"
+  content = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "StayInOrg"
+        Effect   = "Deny"
+        Action   = ["organizations:LeaveOrganization", "account:CloseAccount", "account:PutAlternateContact", "account:DeleteAlternateContact"]
+        Resource = "*"
+      },
+      {
+        Sid       = "OneRegion"
+        Effect    = "Deny"
+        NotAction = local.global_services
+        Resource  = "*"
+        Condition = { StringNotEquals = { "aws:RequestedRegion" = var.region } }
+      },
+      {
+        Sid    = "KeepAdminRole"
+        Effect = "Deny"
+        Action = [
+          "iam:DeleteRole", "iam:UpdateRole", "iam:UpdateAssumeRolePolicy",
+          "iam:AttachRolePolicy", "iam:DetachRolePolicy", "iam:PutRolePolicy",
+          "iam:DeleteRolePolicy", "iam:PutRolePermissionsBoundary",
+          "iam:DeleteRolePermissionsBoundary", "iam:TagRole", "iam:UntagRole",
+        ]
+        Resource = "arn:aws:iam::*:role/OrganizationAccountAccessRole"
+      },
+      {
+        # Up-front or long-term charges land before the budget can react.
+        Sid    = "NoCommitments"
+        Effect = "Deny"
+        Action = [
+          "ec2:PurchaseReservedInstancesOffering", "ec2:AcceptReservedInstancesExchangeQuote",
+          "ec2:PurchaseHostReservation", "ec2:PurchaseScheduledInstances", "ec2:PurchaseCapacityBlock",
+          "ec2:AllocateHosts", "ec2:CreateCapacityReservation",
+          "rds:PurchaseReservedDBInstancesOffering", "elasticache:PurchaseReservedCacheNodesOffering",
+          "redshift:PurchaseReservedNodeOffering", "es:PurchaseReservedInstanceOffering",
+          "dynamodb:PurchaseReservedCapacityOfferings", "memorydb:PurchaseReservedNodesOffering",
+          "savingsplans:CreateSavingsPlan",
+          "route53domains:RegisterDomain", "route53domains:TransferDomain", "route53domains:RenewDomain",
+          "aws-marketplace:Subscribe", "aws-marketplace:CreateAgreementRequest",
+          "shield:CreateSubscription", # Shield Advanced is $3,000/month
+        ]
+        Resource = "*"
+      },
+    ]
+  })
+}
+
+resource "aws_organizations_policy_attachment" "sandbox_guardrails" {
+  policy_id = aws_organizations_policy.sandbox_guardrails.id
+  target_id = local.sandbox_account_id
+}
+
+# Attached by the budget action below when spend hits the cap. Detach it in
+# the Organizations console to reset.
+resource "aws_organizations_policy" "sandbox_over_budget" {
+  name        = "${var.name}-sandbox-over-budget"
+  description = "Budget exceeded: only reading, stopping and deleting are allowed"
+  type        = "SERVICE_CONTROL_POLICY"
+  content = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid    = "OnlyReadStopDelete"
+      Effect = "Deny"
+      NotAction = [
+        "sts:*", "iam:Get*", "iam:List*", "iam:Delete*", "iam:Detach*", "iam:Remove*",
+        "ec2:Describe*", "ec2:Get*", "ec2:Stop*", "ec2:Terminate*", "ec2:Delete*",
+        "ec2:Detach*", "ec2:Disassociate*", "ec2:Release*", "ec2:Revoke*",
+        "autoscaling:Describe*", "autoscaling:Delete*", "autoscaling:UpdateAutoScalingGroup", "autoscaling:SetDesiredCapacity",
+        "elasticloadbalancing:Describe*", "elasticloadbalancing:Delete*", "elasticloadbalancing:Deregister*",
+        "rds:Describe*", "rds:List*", "rds:Stop*", "rds:Delete*",
+        "ecs:Describe*", "ecs:List*", "ecs:UpdateService", "ecs:StopTask", "ecs:Delete*", "ecs:Deregister*",
+        "eks:Describe*", "eks:List*", "eks:Delete*",
+        "lambda:Get*", "lambda:List*", "lambda:Delete*", "lambda:PutFunctionConcurrency",
+        "s3:Get*", "s3:List*", "s3:Delete*", "s3:PutLifecycleConfiguration",
+        "dynamodb:Describe*", "dynamodb:List*", "dynamodb:DeleteTable",
+        "elasticache:Describe*", "elasticache:Delete*",
+        "cloudformation:Describe*", "cloudformation:List*", "cloudformation:Get*", "cloudformation:DeleteStack",
+        "cloudfront:Get*", "cloudfront:List*", "cloudfront:UpdateDistribution", "cloudfront:DeleteDistribution",
+        "logs:Describe*", "logs:Get*", "logs:FilterLogEvents", "logs:Delete*",
+        "ssm:SendCommand", "ssm:GetCommandInvocation", "ssm:Describe*", "ssm:List*",
+        "ecr:Describe*", "ecr:List*", "ecr:BatchDelete*", "ecr:DeleteRepository",
+        "kms:Describe*", "kms:List*", "kms:ScheduleKeyDeletion", "kms:DisableKey",
+        "route53:Get*", "route53:List*", "route53:Delete*", "route53:ChangeResourceRecordSets",
+        "tag:Get*", "resource-groups:*", "ce:*", "budgets:View*", "pricing:*",
+      ]
+      Resource = "*"
+    }]
+  })
+}
+
+resource "aws_iam_role" "budget_action" {
+  name = "${var.name}-sandbox-budget-action"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "budgets.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+      Condition = { StringEquals = { "aws:SourceAccount" = data.aws_caller_identity.current.account_id } }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy" "budget_action" {
+  name = "attach-over-budget-scp"
+  role = aws_iam_role.budget_action.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["organizations:AttachPolicy", "organizations:DetachPolicy"]
+        Resource = [aws_organizations_policy.sandbox_over_budget.arn, aws_organizations_account.sandbox.arn]
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["organizations:DescribePolicy", "organizations:ListPolicies", "organizations:ListTargetsForPolicy"]
+        Resource = "*"
+      },
+    ]
+  })
+}
+
+resource "aws_budgets_budget" "sandbox" {
+  name         = "${var.name}-sandbox-monthly"
+  budget_type  = "COST"
+  limit_amount = tostring(var.sandbox_monthly_budget_usd)
+  limit_unit   = "USD"
+  time_unit    = "MONTHLY"
+
+  cost_filter {
+    name   = "LinkedAccount"
+    values = [local.sandbox_account_id]
+  }
+
+  dynamic "notification" {
+    for_each = [
+      { type = "ACTUAL", pct = 50 },
+      { type = "ACTUAL", pct = 80 },
+      { type = "FORECASTED", pct = 100 },
+    ]
+    content {
+      comparison_operator        = "GREATER_THAN"
+      notification_type          = notification.value.type
+      threshold                  = notification.value.pct
+      threshold_type             = "PERCENTAGE"
+      subscriber_email_addresses = [var.sandbox_account_email]
+    }
+  }
+}
+
+resource "aws_budgets_budget_action" "sandbox_cap" {
+  budget_name        = aws_budgets_budget.sandbox.name
+  action_type        = "APPLY_SCP_POLICY"
+  approval_model     = "AUTOMATIC"
+  notification_type  = "ACTUAL"
+  execution_role_arn = aws_iam_role.budget_action.arn
+
+  action_threshold {
+    action_threshold_type  = "PERCENTAGE"
+    action_threshold_value = 100
+  }
+
+  definition {
+    scp_action_definition {
+      policy_id  = aws_organizations_policy.sandbox_over_budget.id
+      target_ids = [local.sandbox_account_id]
+    }
+  }
+
+  subscriber {
+    address           = var.sandbox_account_email
+    subscription_type = "EMAIL"
+  }
+
+  depends_on = [aws_iam_role_policy.budget_action]
+}
+
+# The dev box may become the sandbox admin, and may read costs (Cost Explorer
+# shows the whole org; read-only) so it can watch spend itself.
+resource "aws_iam_role_policy" "dev_sandbox_account" {
+  name = "sandbox-account-admin"
+  role = aws_iam_role.dev.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid      = "BecomeSandboxAdmin"
+        Effect   = "Allow"
+        Action   = "sts:AssumeRole"
+        Resource = local.sandbox_admin_role
+      },
+      {
+        Sid      = "ReadCosts"
+        Effect   = "Allow"
+        Action   = ["ce:Get*", "ce:Describe*", "ce:List*", "budgets:ViewBudget", "budgets:DescribeBudgetAction*"]
+        Resource = "*"
+      },
+    ]
+  })
+}
+
 # ---------- Outputs ----------
 
 output "public_ip" {
@@ -912,4 +1186,13 @@ output "power_links" {
     for a in ["start", "stop", "status"] :
     "${aws_lambda_function_url.power.function_url}?action=${a}&token=${random_password.power_token.result}"
   ])
+}
+
+output "sandbox_account_id" {
+  value = local.sandbox_account_id
+}
+
+# For ~/.aws/config on the dev box (Claude adds it after apply).
+output "sandbox_cli_profile" {
+  value = "[profile sandbox]\nrole_arn = ${local.sandbox_admin_role}\ncredential_source = Ec2InstanceMetadata\nregion = ${var.region}"
 }
